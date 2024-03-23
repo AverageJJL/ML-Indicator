@@ -1,0 +1,143 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © AverageJJL
+
+//@version=5
+//, max_labels_count=300, format=format.price, precision=2, timeframe="", timeframe_gaps=true, 
+indicator('Machine Learning kNN indicator', 'ml-knn', overlay = false, timeframe="", timeframe_gaps=true)
+//labels are the red and blue labels
+//format.price so all outputs are prices
+//precision is the number of numbers after decimal points
+//timeframe creates a filed in the script's settings tab to allow the user to specify the cahart's timeframe - if left alone it will be default timeframe.period
+
+
+//-- Preset Dates
+
+int startdate = timestamp('01 Jan 2000 00:00:00 GMT+10')
+int stopdate  = timestamp('31 Dec 2025 23:45:00 GMT+10')
+
+//-- Inputs
+
+StartDate  = input.time  (startdate, 'Start Date')
+StopDate   = input.time  (stopdate,  'Stop Date')
+Indicator  = input.string('All',     'Indicator',   ['RSI','ROC','CCI','VWAP','All'])
+ShortWinow = input.int   (14,        'Short Period [1..n]', 1)
+LongWindow = input.int   (28,        'Long Period [2..n]',  2)
+BaseK      = input.int   (252,       'Base No. of Neighbours (K) [5..n]', 5)
+Filter     = input.bool  (false,     'Volatility Filter')
+//Bars       = input.int   (300,       'Bar Threshold [2..5000]', 2, 5000)
+matrix_size = input.int   (6000,       'matrix_size')
+
+rsi_short_w = input.float   (1,       'rsi_short_w')
+rsi_long_w  = input.float   (1,       'rsi_long_w')
+cci_short_w = input.float   (1,       'cci_short_w')
+cci_long_w  = input.float   (1,       'cci_long_w')
+roc_short_w = input.float   (1,       'roc_short_w')
+roc_long_w  = input.float   (1,       'roc_long_w')
+vwap_short_w = input.float   (1,       'vwap_short_w')
+vwap_long_w = input.float   (1,       'rsi_short_w')
+comb_rc_w = input.float   (1,       'comb_rc_w')
+comb_cci_w = input.float   (1,       'comb_cci_w')
+short_window_weight = input.float   (1,       'short_window_weight')
+long_window_weight = input.float   (1,       'long_window_weight')
+
+var int k     = math.floor(math.sqrt(BaseK))  // k Value for kNN algo
+
+
+// Training data, normalized to the range of [0,...,100]
+var dataPoints = matrix.new<float>(matrix_size,4,0)
+var row_index = 0
+
+// Result data
+var array<float>   predictions = array.new<float>()
+var float        prediction  = 0.0
+
+
+
+
+//-- Functions
+
+minimax(float x, int p, float min, float max) => 
+    float hi = ta.highest(x, p), float lo = ta.lowest(x, p)
+    (max - min) * (x - lo)/(hi - lo) + min
+
+cAqua(int g) => g>9?#0080FFff:g>8?#0080FFe5:g>7?#0080FFcc:g>6?#0080FFb2:g>5?#0080FF99:g>4?#0080FF7f:g>3?#0080FF66:g>2?#0080FF4c:g>1?#0080FF33:#00C0FF19
+cPink(int g) => g>9?#FF0080ff:g>8?#FF0080e5:g>7?#FF0080cc:g>6?#FF0080b2:g>5?#FF008099:g>4?#FF00807f:g>3?#FF008066:g>2?#FF00804c:g>1?#FF008033:#FF008019
+
+inside_window(float start, float stop) =>  
+    time >= start and time <= stop ? true : false
+
+bool window = inside_window(StartDate, StopDate)
+
+int long_short_average = math.floor((LongWindow+ShortWinow)/2)
+// 3 pairs of predictor indicators, long and short each
+float rs = ta.rsi(close,   LongWindow), //calc rsi for close price over long window (28 bars)
+float rl = ta.rsi(close,   ShortWinow)  //calc rsi for close price over short window (14 bars)
+float comb_rsi = ((rsi_short_w*rs)+(rsi_long_w*rl))/(rsi_short_w+rsi_long_w)
+
+float cs = ta.cci(close,   10),  //calc Commodity Channel Index (CCI) for the given close prices over a specified LongWindow.
+float cl = ta.cci(close,   5)   //does same as above but over short window
+float comb_cci = ((cci_short_w*cs)+(cci_long_w*cl))/(cci_short_w+cci_long_w)
+
+float rocs = ta.roc(close,   10),   // calculates the Rate of Change (ROC) for the given close prices over a specified LongWindow.
+float rocl = ta.roc(close,   5)     //same as above but over short window
+float comb_roc = ((roc_short_w*rocs)+(roc_long_w*rocl))/(roc_short_w+roc_long_w)
+
+float comb_cr =  (comb_rc_w*minimax(comb_roc,10,-10,10) + comb_cci_w*minimax(comb_cci,10,-10,10)) / (comb_rc_w+comb_cci_w)
+
+float vwaps = minimax(ta.vwap, LongWindow, 0, 99), //normalises vwap over long window
+float vwapl = minimax(ta.vwap, ShortWinow, 0, 99) //normalises vwap over short window
+float comb_vwap = ((vwap_short_w*vwaps)+(vwap_long_w*vwapl))/(vwap_short_w+vwap_long_w)
+
+float normalised_short_window = minimax((close[5]-close[10]),5,-10,10)
+float normalised_long_window = minimax((close[0]-close[10]),10,-10,10)
+float label = (short_window_weight*normalised_short_window + long_window_weight*normalised_long_window)/(short_window_weight+long_window_weight)
+
+array<float> new_point = array.new<float>(3)
+new_point.set(0,comb_vwap)
+new_point.set(1,comb_rsi)
+new_point.set(2,comb_cr)
+
+// Use particular training period
+if window
+    if row_index == matrix_size
+        row_index := 0
+    for i=0 to 3
+        switch i
+            0 => dataPoints.set(row_index, i, comb_vwap)  //x value, vwap value
+            1 => dataPoints.set(row_index, i, comb_rsi)   //y value, rsi value
+            2 => dataPoints.set(row_index, i, comb_cr)    //z value, cr value
+            3 => dataPoints.set(row_index, i, label)      //label value
+    row_index := row_index + 1
+
+float maxdist = 9999.0
+for i=0 to dataPoints.rows()-1
+    //calc distance
+    float d = math.sqrt(math.pow(array.get(new_point,0)-dataPoints.row(i).get(0),2) + math.pow(array.get(new_point,1)-dataPoints.row(i).get(1),2) + math.pow(array.get(new_point,2)-dataPoints.row(i).get(2),2))
+
+    if d < maxdist
+        maxdist := d
+        if array.size(predictions) == k
+            array.shift(predictions)
+        array.push(predictions, dataPoints.row(i).get(3))
+
+// Get the overall prediction of k nearest neighbours
+prediction := array.sum(predictions)/k 
+
+bool filter = Filter ? ta.atr(10) > ta.atr(40) : true // filter out by volatility or ex. ta.atr(1) > ta.atr(10)...
+
+color pred_color = na
+
+if prediction > -1 and prediction < 1
+    pred_color := color.rgb(97, 97, 97) 
+else if prediction < -1 and prediction > -3
+    pred_color := color.rgb(249, 153, 153)
+else if prediction < -3
+    pred_color := color.rgb(255, 0, 0)
+else if prediction > 1 and prediction < 3
+    pred_color := color.rgb(170, 255, 173)
+else if prediction > 3
+    pred_color := color.rgb(0, 151, 5)
+else
+    pred_color := color.rgb(97, 97, 97)
+//plot(prediction, "Prediction", color.blue, 3)
+plot(ta.sma(close,14), title="Simple Moving Average", color=pred_color)
